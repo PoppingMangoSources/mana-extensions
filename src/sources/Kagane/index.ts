@@ -107,9 +107,14 @@ type SearchPage = { result: PagedSearchResult, next: number, seenIDs: string[] }
 
 export class Target implements ContentSource, PageLinkResolver, CoverRequestHandler, PageRequestHandler, SourcePreferenceProvider {
     readonly info: SourceInfo = {
-        id: 'Kagane', version: '0.0.1-alpha.20', name: 'Kagane',
+        id: 'Kagane', version: '0.0.1-alpha.21', name: 'Kagane',
         description: 'Kagane with current API support, grouped tags and global four-category content settings.',
         thumbnail: 'Kagane.png', rating: CatalogRating.MIXED, website: DOMAIN,
+        // Without these Mana only lists the source to readers who allow every language.
+        supportedLanguages: [
+            'en_US', 'ja_JP', 'ko_KR', 'zh-CN', 'zh-TW', 'es_ES', 'es_419', 'fr_FR', 'de_DE', 'it_IT',
+            'pt_PT', 'pt_BR', 'ru_RU', 'pl_PL', 'tr_TR', 'ar_SA', 'id_ID', 'th_TH', 'vi_VN', 'hi_IN'
+        ],
         badges: ['Manga', 'Manhwa', 'Manhua', 'Comic'],
         developers: [{ name: 'Lucifers Circle', github: 'https://github.com/LucifersCircle' }, { name: 'PoppingMango Sources', github: 'https://github.com/PoppingMangoSources' }]
     }
@@ -367,25 +372,34 @@ export class Target implements ContentSource, PageLinkResolver, CoverRequestHand
     async getContent(contentId: string, context?: SourceContext): Promise<Content> {
         assertRatingPolicy(context)
         return this.withSettings(async (settings) => {
-            const details = await this.requireAllowed(contentId, settings, context)
-            const tracker = strictUUID(details.tracker_id)
             // A migration only needs metadata.
             const migrating = context?.origin === SourceContextOrigin.MIGRATION
+            // More like this is the slowest request on the page and needs nothing from the details,
+            // so it starts alongside them instead of after the editions come back.
+            const similarRows = migrating ? undefined : this.similarRows(contentId, settings, context)
+            const details = await this.requireAllowed(contentId, settings, context)
+            const tracker = strictUUID(details.tracker_id)
             const [sources, rows, tags] = await Promise.all([
                 this.api.sources(),
                 tracker && !migrating && !settings.excludedGenres.length && !settings.excludedTags.length ? this.api.trackerSeries(tracker) : Promise.resolve([]),
                 visibleDetailTags(details, settings).length ? this.api.tags() : Promise.resolve([])
             ])
             const result = content(contentId, details, settings, sources, tags)
-            const editions = migrating ? undefined : editionSection(rows, contentId, settings, context?.allowedContentRatings) ?? await this.similar(contentId, settings, sources, context)
+            const editions = similarRows ? editionSection(rows, contentId, settings, context?.allowedContentRatings) ?? this.similar(contentId, await similarRows, settings, sources, context) : undefined
             return editions ? { ...result, additionalInfo: [...(result.additionalInfo ?? []), editions] } : result
         })
     }
 
-    private async similar(id: string, settings: Settings, sources: UploadSource[], context?: SourceContext): Promise<HighlightsSection | undefined> {
+    // Never rejects: it can be left unawaited when the title turns out to be excluded.
+    private similarRows(id: string, settings: Settings, context?: SourceContext): ReturnType<KaganeApi['similar']> {
+        const ratings = selectedRatings({ page: 1, context }, settings)
+        if (!ratings.length) return Promise.resolve([])
+        return this.api.similar(id, ratings, settings.languages, settings.uploadSource, settings.hideDisturbing).catch(() => [])
+    }
+
+    private similar(id: string, rows: Awaited<ReturnType<KaganeApi['similar']>>, settings: Settings, sources: UploadSource[], context?: SourceContext): HighlightsSection | undefined {
         const ratings = selectedRatings({ page: 1, context }, settings)
         if (!ratings.length) return undefined
-        const rows = await this.api.similar(id, ratings, settings.languages, settings.uploadSource, settings.hideDisturbing).catch(() => [])
         const seen = new Set([id])
         return similarSection(rows.filter((row) => {
             if (seen.has(row.series_id) || row.hidden_by_filter || !visibleRow(row, settings, ratings, sources, context)) return false
@@ -404,11 +418,18 @@ export class Target implements ContentSource, PageLinkResolver, CoverRequestHand
 
     async getChapterData(contentId: string, chapterId: string): Promise<ChapterData> {
         return this.withSettings(async (settings) => {
-            await this.requireAllowed(contentId, settings)
             validId(chapterId)
-            const book = (await this.api.books(contentId)).find((entry) => entry.book_id === chapterId)
+            // Asked for together: a chapter opened from history would otherwise wait on the details
+            // and the whole chapter list before the reader is asked for its pages. Each is still
+            // checked first, and the reader's own failure waits for the checks, so an unavailable
+            // chapter still says so.
+            const reader = this.api.challenge(chapterId, settings.dataSaver).then((value) => ({ value }), (error: unknown) => ({ error }))
+            const [, books] = await Promise.all([this.requireAllowed(contentId, settings), this.api.books(contentId)])
+            const book = books.find((entry) => entry.book_id === chapterId)
             if (!book || !available(book)) throw new Error('Kagane chapter is unavailable or does not belong to this series')
-            const challenge = await this.api.challenge(chapterId, settings.dataSaver)
+            const answer = await reader
+            if ('error' in answer) throw answer.error
+            const challenge = answer.value
             if (Number.isSafeInteger(book.page_count) && (book.page_count ?? 0) > 0 && challenge.manifest?.pages?.length !== book.page_count) throw new Error('Kagane reader returned an incomplete chapter manifest')
             const pages = [...(challenge.manifest?.pages ?? [])].sort((left, right) => left.page_no - right.page_no).map((page) => ({ url: this.api.pageURL(challenge, chapterId, page, settings.dataSaver) }))
             // Retain page identity so an expired provider token can be renewed safely.
